@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build-universal:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build arm64
+        run: swift build -c release --arch arm64
+
+      - name: Build x86_64
+        run: swift build -c release --arch x86_64
+
+      - name: Create universal app
+        run: |
+          set -euo pipefail
+          APP_NAME="MenuBarVisualizer"
+          ROOT="${GITHUB_WORKSPACE}"
+          ARM_BIN="${ROOT}/.build/arm64-apple-macosx/release/${APP_NAME}"
+          X86_BIN="${ROOT}/.build/x86_64-apple-macosx/release/${APP_NAME}"
+          UNIVERSAL_BIN="${ROOT}/dist/${APP_NAME}"
+
+          mkdir -p "${ROOT}/dist"
+          lipo -create -output "${UNIVERSAL_BIN}" "${ARM_BIN}" "${X86_BIN}"
+
+          APP_DIR="${ROOT}/dist/${APP_NAME}.app"
+          rm -rf "${APP_DIR}"
+          mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources"
+          cp "${UNIVERSAL_BIN}" "${APP_DIR}/Contents/MacOS/${APP_NAME}"
+          cp "${ROOT}/Resources/Info.plist" "${APP_DIR}/Contents/Info.plist"
+          cp "${ROOT}/Resources/AppIcon.icns" "${APP_DIR}/Contents/Resources/AppIcon.icns"
+
+          lipo -info "${APP_DIR}/Contents/MacOS/${APP_NAME}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MenuBarVisualizer-universal
+          path: dist/MenuBarVisualizer.app
