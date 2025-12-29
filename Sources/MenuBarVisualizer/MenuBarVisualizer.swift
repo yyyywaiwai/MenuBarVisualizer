@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import ServiceManagement
 import ScreenCaptureKit
 import AVFoundation
 import Accelerate
@@ -171,6 +172,7 @@ final class SettingsStore {
         static let smoothBarHeight = "smoothBarHeight"
         static let smoothFrequencyEnabled = "smoothFrequencyEnabled"
         static let smoothFrequencyRadius = "smoothFrequencyRadius"
+        static let hideWhenSilent = "hideWhenSilent"
     }
 
     private let defaults = UserDefaults.standard
@@ -184,6 +186,7 @@ final class SettingsStore {
     private var _smoothBarHeight: Bool
     private var _smoothFrequencyEnabled: Bool
     private var _smoothFrequencyRadius: Int
+    private var _hideWhenSilent: Bool
 
     var onChange: (() -> Void)?
 
@@ -283,6 +286,33 @@ final class SettingsStore {
         }
     }
 
+    var hideWhenSilent: Bool {
+        get { _hideWhenSilent }
+        set {
+            guard newValue != _hideWhenSilent else { return }
+            _hideWhenSilent = newValue
+            defaults.set(newValue, forKey: Key.hideWhenSilent)
+            onChange?()
+        }
+    }
+
+    var launchAtLoginEnabled: Bool {
+        if #available(macOS 13.0, *) {
+            return SMAppService.mainApp.status == .enabled
+        }
+        return false
+    }
+
+    func setLaunchAtLoginEnabled(_ enabled: Bool) throws {
+        if #available(macOS 13.0, *) {
+            if enabled {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+        }
+    }
+
     var barColor: NSColor {
         get { _barColor }
         set {
@@ -324,6 +354,7 @@ final class SettingsStore {
         let savedSmoothBarHeight = defaults.object(forKey: Key.smoothBarHeight) as? Bool
         let savedSmoothFrequencyEnabled = defaults.object(forKey: Key.smoothFrequencyEnabled) as? Bool
         let savedSmoothFrequencyRadius = defaults.object(forKey: Key.smoothFrequencyRadius) as? Int
+        let savedHideWhenSilent = defaults.object(forKey: Key.hideWhenSilent) as? Bool
         let defaultHeight: CGFloat = 30
         let defaultAlpha: CGFloat = 0.0
         let defaultBarCount = 160
@@ -332,6 +363,7 @@ final class SettingsStore {
         let defaultSmoothBarHeight = true
         let defaultSmoothFrequencyEnabled = true
         let defaultSmoothFrequencyRadius = 2
+        let defaultHideWhenSilent = false
 
         let minValue = Self.minBarHeight
         let maxValue = Self.maxBarHeight
@@ -366,6 +398,7 @@ final class SettingsStore {
         _smoothBarHeight = savedSmoothBarHeight ?? defaultSmoothBarHeight
         _smoothFrequencyEnabled = savedSmoothFrequencyEnabled ?? defaultSmoothFrequencyEnabled
         _smoothFrequencyRadius = Self.clampFrequencyRadius(savedSmoothFrequencyRadius ?? defaultSmoothFrequencyRadius)
+        _hideWhenSilent = savedHideWhenSilent ?? defaultHideWhenSilent
     }
 
     private func clampBarHeight(_ value: CGFloat) -> CGFloat {
@@ -421,6 +454,10 @@ final class OverlayController: NSObject {
     private let settings: SettingsStore
     private var userVisible = true
     private var fullscreenHidden = false
+    private var silenceHidden = false
+    private var lastNonSilentTime = CFAbsoluteTimeGetCurrent()
+    private let silenceThreshold: Float = 0.02
+    private let silenceHold: CFTimeInterval = 1.2
 
     init(barCount: Int, settings: SettingsStore) {
         self.settings = settings
@@ -480,6 +517,7 @@ final class OverlayController: NSObject {
 
     func updateLevels(_ levels: [Float]) {
         visualizerView.updateLevels(levels)
+        evaluateSilence(with: levels)
     }
 
     func applySettings() {
@@ -504,8 +542,14 @@ final class OverlayController: NSObject {
         refreshVisibility()
     }
 
+    private func setSilenceHidden(_ hidden: Bool) {
+        guard hidden != silenceHidden else { return }
+        silenceHidden = hidden
+        refreshVisibility()
+    }
+
     private func refreshVisibility() {
-        if userVisible && !fullscreenHidden {
+        if userVisible && !fullscreenHidden && !silenceHidden {
             window.orderFrontRegardless()
         } else {
             window.orderOut(nil)
@@ -526,6 +570,24 @@ final class OverlayController: NSObject {
         let frame = OverlayController.frame(for: screen, barHeight: settings.barHeight)
         window.setFrame(frame, display: true)
         visualizerView.needsDisplay = true
+    }
+
+    private func evaluateSilence(with levels: [Float]) {
+        guard settings.hideWhenSilent else {
+            lastNonSilentTime = CFAbsoluteTimeGetCurrent()
+            setSilenceHidden(false)
+            return
+        }
+        let maxLevel = levels.max() ?? 0
+        let now = CFAbsoluteTimeGetCurrent()
+        if maxLevel > silenceThreshold {
+            lastNonSilentTime = now
+            setSilenceHidden(false)
+            return
+        }
+        if now - lastNonSilentTime >= silenceHold {
+            setSilenceHidden(true)
+        }
     }
 
     private func evaluateFullscreen() {
@@ -866,6 +928,8 @@ final class SettingsWindowController: NSWindowController {
     private let barColorValueLabel: NSTextField
     private let reverseDirectionButton: NSButton
     private let smoothBarHeightButton: NSButton
+    private let launchAtLoginButton: NSButton
+    private let hideWhenSilentButton: NSButton
     private let showAdvancedButton: NSButton
     private let smoothFrequencyButton: NSButton
     private let smoothFrequencySlider: NSSlider
@@ -906,6 +970,14 @@ final class SettingsWindowController: NSWindowController {
         smoothButton.state = settings.smoothBarHeight ? .on : .off
         self.smoothBarHeightButton = smoothButton
 
+        let launchButton = NSButton(checkboxWithTitle: "Launch at Login", target: nil, action: nil)
+        launchButton.state = settings.launchAtLoginEnabled ? .on : .off
+        self.launchAtLoginButton = launchButton
+
+        let hideWhenSilentButton = NSButton(checkboxWithTitle: "Hide When Silent", target: nil, action: nil)
+        hideWhenSilentButton.state = settings.hideWhenSilent ? .on : .off
+        self.hideWhenSilentButton = hideWhenSilentButton
+
         let showAdvancedButton = NSButton(checkboxWithTitle: "Show Advanced Settings", target: nil, action: nil)
         showAdvancedButton.state = .off
         self.showAdvancedButton = showAdvancedButton
@@ -927,7 +999,7 @@ final class SettingsWindowController: NSWindowController {
 
         let advancedStack = NSStackView()
         advancedStack.orientation = .vertical
-        advancedStack.spacing = 8
+        advancedStack.spacing = 6
         advancedStack.translatesAutoresizingMaskIntoConstraints = false
         self.advancedStack = advancedStack
 
@@ -947,9 +1019,12 @@ final class SettingsWindowController: NSWindowController {
                               defer: false)
         window.title = "Visualizer Settings"
         window.isReleasedWhenClosed = false
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.isMovableByWindowBackground = true
         let stack = NSStackView()
         stack.orientation = .vertical
-        stack.spacing = 12
+        stack.spacing = 10
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
         self.mainStack = stack
@@ -968,6 +1043,10 @@ final class SettingsWindowController: NSWindowController {
         reverseButton.action = #selector(reverseDirectionChanged(_:))
         smoothButton.target = self
         smoothButton.action = #selector(smoothBarHeightChanged(_:))
+        launchButton.target = self
+        launchButton.action = #selector(launchAtLoginChanged(_:))
+        hideWhenSilentButton.target = self
+        hideWhenSilentButton.action = #selector(hideWhenSilentChanged(_:))
         showAdvancedButton.target = self
         showAdvancedButton.action = #selector(showAdvancedChanged(_:))
         smoothFrequencyButton.target = self
@@ -979,6 +1058,7 @@ final class SettingsWindowController: NSWindowController {
         thresholdSlider.target = self
         thresholdSlider.action = #selector(thresholdChanged(_:))
 
+        applyUIStyles()
         configureContent()
         refreshLabels()
         updateAdvancedVisibility()
@@ -990,6 +1070,8 @@ final class SettingsWindowController: NSWindowController {
 
     func show() {
         guard let window else { return }
+        launchAtLoginButton.state = settings.launchAtLoginEnabled ? .on : .off
+        hideWhenSilentButton.state = settings.hideWhenSilent ? .on : .off
         window.center()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -1009,6 +1091,9 @@ final class SettingsWindowController: NSWindowController {
         mainStack.addArrangedSubview(sectionLabel("Smoothing"))
         mainStack.addArrangedSubview(smoothBarHeightButton)
         mainStack.addArrangedSubview(sectionSeparator())
+        mainStack.addArrangedSubview(sectionLabel("Visibility"))
+        mainStack.addArrangedSubview(hideWhenSilentButton)
+        mainStack.addArrangedSubview(sectionSeparator())
         mainStack.addArrangedSubview(sectionLabel("Background Opacity"))
         mainStack.addArrangedSubview(opacitySlider)
         mainStack.addArrangedSubview(opacityValueLabel)
@@ -1022,6 +1107,9 @@ final class SettingsWindowController: NSWindowController {
         mainStack.addArrangedSubview(barColorValueLabel)
         mainStack.addArrangedSubview(sectionSeparator())
         mainStack.addArrangedSubview(reverseDirectionButton)
+        mainStack.addArrangedSubview(sectionSeparator())
+        mainStack.addArrangedSubview(sectionLabel("Startup"))
+        mainStack.addArrangedSubview(launchAtLoginButton)
         mainStack.addArrangedSubview(sectionSeparator())
         mainStack.addArrangedSubview(sectionLabel("Threshold"))
         mainStack.addArrangedSubview(thresholdSlider)
@@ -1043,6 +1131,51 @@ final class SettingsWindowController: NSWindowController {
             mainStack.topAnchor.constraint(equalTo: contentView.topAnchor),
             mainStack.bottomAnchor.constraint(lessThanOrEqualTo: contentView.bottomAnchor)
         ])
+    }
+
+    private func applyUIStyles() {
+        let valueFont = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        let valueLabels = [
+            heightValueLabel,
+            opacityValueLabel,
+            barCountValueLabel,
+            barOpacityValueLabel,
+            barColorValueLabel,
+            thresholdValueLabel,
+            smoothFrequencyValueLabel
+        ]
+        for label in valueLabels {
+            label.font = valueFont
+            label.textColor = .secondaryLabelColor
+            label.alignment = .right
+        }
+
+        let sliders = [
+            heightSlider,
+            opacitySlider,
+            barOpacitySlider,
+            barCountSlider,
+            thresholdSlider,
+            smoothFrequencySlider
+        ]
+        for slider in sliders {
+            slider.controlSize = .small
+            slider.cell?.controlSize = .small
+        }
+
+        let buttons = [
+            reverseDirectionButton,
+            smoothBarHeightButton,
+            launchAtLoginButton,
+            hideWhenSilentButton,
+            showAdvancedButton,
+            smoothFrequencyButton
+        ]
+        for button in buttons {
+            button.controlSize = .small
+            button.cell?.controlSize = .small
+            button.font = NSFont.systemFont(ofSize: 12)
+        }
     }
 
     private func sectionLabel(_ text: String) -> NSTextField {
@@ -1098,6 +1231,26 @@ final class SettingsWindowController: NSWindowController {
 
     @objc private func smoothBarHeightChanged(_ sender: NSButton) {
         settings.smoothBarHeight = (sender.state == .on)
+    }
+
+    @objc private func hideWhenSilentChanged(_ sender: NSButton) {
+        settings.hideWhenSilent = (sender.state == .on)
+    }
+
+    @objc private func launchAtLoginChanged(_ sender: NSButton) {
+        let enabled = sender.state == .on
+        do {
+            try settings.setLaunchAtLoginEnabled(enabled)
+        } catch {
+            sender.state = settings.launchAtLoginEnabled ? .on : .off
+            NSApp.activate(ignoringOtherApps: true)
+            let alert = NSAlert()
+            alert.messageText = "Failed to update Login Item"
+            alert.informativeText = error.localizedDescription
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+        }
     }
 
     @objc private func showAdvancedChanged(_ sender: NSButton) {
