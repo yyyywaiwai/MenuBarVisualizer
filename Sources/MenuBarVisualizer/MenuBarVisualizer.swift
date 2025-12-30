@@ -16,6 +16,10 @@ final class MenuBarVisualizerApp: NSObject, NSApplicationDelegate {
     private var settingsWindowController: SettingsWindowController?
     private var isVisualizerVisible = true
     private var didShowAccessibilityAlert = false
+    private var didShowScreenRecordingAlert = false
+    private var shouldResumeAudioCapture = false
+    private var isSessionActive = true
+    private var audioRestartTimer: Timer?
     private let accessibilityPromptKey = "didPromptAccessibility"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -36,19 +40,13 @@ final class MenuBarVisualizerApp: NSObject, NSApplicationDelegate {
                 overlay?.updateLevels(bands)
             }
         }
-        audioCapture.onError = { message in
+        audioCapture.onError = { [weak self] message in
             Task { @MainActor in
-                NSApp.activate(ignoringOtherApps: true)
-                let alert = NSAlert()
-                alert.messageText = "Audio Capture Error"
-                alert.informativeText = message
-                alert.alertStyle = .warning
-                alert.addButton(withTitle: "OK")
-                alert.runModal()
+                self?.handleAudioCaptureError(message)
             }
         }
         self.audioCapture = audioCapture
-        audioCapture.start()
+        startAudioCaptureIfNeeded(forceAlert: true)
 
         settings.onChange = { [weak self] in
             guard let self, let settings = self.settings else { return }
@@ -62,6 +60,7 @@ final class MenuBarVisualizerApp: NSObject, NSApplicationDelegate {
         }
 
         setupStatusItem()
+        setupSystemObservers()
         requestAccessibilityIfNeeded()
     }
 
@@ -89,6 +88,10 @@ final class MenuBarVisualizerApp: NSObject, NSApplicationDelegate {
         let accessibilityItem = NSMenuItem(title: "Enable Accessibility…", action: #selector(requestAccessibility(_:)), keyEquivalent: "")
         accessibilityItem.target = self
         menu.addItem(accessibilityItem)
+
+        let screenRecordingItem = NSMenuItem(title: "Enable Screen Recording…", action: #selector(requestScreenRecording(_:)), keyEquivalent: "")
+        screenRecordingItem.target = self
+        menu.addItem(screenRecordingItem)
         menu.addItem(.separator())
 
         let quitItem = NSMenuItem(title: "Quit", action: #selector(quitApp(_:)), keyEquivalent: "q")
@@ -127,6 +130,10 @@ final class MenuBarVisualizerApp: NSObject, NSApplicationDelegate {
         requestAccessibilityIfNeeded(forceAlert: true)
     }
 
+    @objc private func requestScreenRecording(_ sender: NSMenuItem) {
+        startAudioCaptureIfNeeded(forceAlert: true)
+    }
+
     private func requestAccessibilityIfNeeded(forceAlert: Bool = false) {
         guard AXIsProcessTrusted() == false else { return }
         let defaults = UserDefaults.standard
@@ -154,6 +161,109 @@ final class MenuBarVisualizerApp: NSObject, NSApplicationDelegate {
     private func openAccessibilitySettings() {
         guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") else { return }
         NSWorkspace.shared.open(url)
+    }
+
+    private func handleAudioCaptureError(_ message: String) {
+        shouldResumeAudioCapture = true
+        if isScreenRecordingAuthorized() == false {
+            requestScreenRecordingIfNeeded()
+            return
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Audio Capture Error"
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+        scheduleAudioCaptureRetry()
+    }
+
+    private func setupSystemObservers() {
+        let center = NSWorkspace.shared.notificationCenter
+        center.addObserver(self, selector: #selector(handleWillSleep(_:)), name: NSWorkspace.willSleepNotification, object: nil)
+        center.addObserver(self, selector: #selector(handleDidWake(_:)), name: NSWorkspace.didWakeNotification, object: nil)
+        center.addObserver(self, selector: #selector(handleSessionDidResignActive(_:)), name: NSWorkspace.sessionDidResignActiveNotification, object: nil)
+        center.addObserver(self, selector: #selector(handleSessionDidBecomeActive(_:)), name: NSWorkspace.sessionDidBecomeActiveNotification, object: nil)
+    }
+
+    @objc private func handleWillSleep(_ notification: Notification) {
+        shouldResumeAudioCapture = true
+        audioCapture?.stop()
+    }
+
+    @objc private func handleDidWake(_ notification: Notification) {
+        if isSessionActive {
+            resumeAudioCaptureIfNeeded()
+        } else {
+            shouldResumeAudioCapture = true
+        }
+    }
+
+    @objc private func handleSessionDidResignActive(_ notification: Notification) {
+        isSessionActive = false
+        shouldResumeAudioCapture = true
+        audioCapture?.stop()
+    }
+
+    @objc private func handleSessionDidBecomeActive(_ notification: Notification) {
+        isSessionActive = true
+        resumeAudioCaptureIfNeeded()
+    }
+
+    private func resumeAudioCaptureIfNeeded() {
+        guard shouldResumeAudioCapture else { return }
+        shouldResumeAudioCapture = false
+        startAudioCaptureIfNeeded()
+    }
+
+    private func startAudioCaptureIfNeeded(forceAlert: Bool = false) {
+        guard isSessionActive else {
+            shouldResumeAudioCapture = true
+            return
+        }
+        guard let audioCapture, audioCapture.isActive == false else { return }
+        if isScreenRecordingAuthorized() {
+            audioCapture.start()
+        } else {
+            requestScreenRecordingIfNeeded(forceAlert: forceAlert)
+        }
+    }
+
+    private func requestScreenRecordingIfNeeded(forceAlert: Bool = false) {
+        guard isScreenRecordingAuthorized() == false else { return }
+        guard forceAlert || didShowScreenRecordingAlert == false else { return }
+        didShowScreenRecordingAlert = true
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Screen Recording Permission Required"
+        alert.informativeText = "To capture audio, allow MenuBarVisualizer in System Settings > Privacy & Security > Screen Recording."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Open System Settings")
+        alert.addButton(withTitle: "Not Now")
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            openScreenRecordingSettings()
+        }
+    }
+
+    private func openScreenRecordingSettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    private func isScreenRecordingAuthorized() -> Bool {
+        return CGPreflightScreenCaptureAccess()
+    }
+
+    private func scheduleAudioCaptureRetry() {
+        guard audioRestartTimer == nil else { return }
+        let timer = Timer(timeInterval: 1.0, repeats: false) { [weak self] _ in
+            self?.audioRestartTimer = nil
+            self?.startAudioCaptureIfNeeded()
+        }
+        audioRestartTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
     }
 }
 
@@ -1320,9 +1430,14 @@ final class AudioCapture: NSObject, SCStreamOutput, @unchecked Sendable {
     private var smoothFrequencyRadius: Int
     private let queue = DispatchQueue(label: "menubar.visualizer.audio")
     private var stream: SCStream?
+    private var isStarting = false
+    private var startGeneration = 0
     private var analyzer: SpectrumAnalyzer?
     var onBands: (([Float]) -> Void)?
     var onError: ((String) -> Void)?
+    var isActive: Bool {
+        return isStarting || stream != nil
+    }
 
     init(bandCount: Int, threshold: Float, smoothFrequencyEnabled: Bool, smoothFrequencyRadius: Int) {
         self.bandCount = bandCount
@@ -1333,23 +1448,41 @@ final class AudioCapture: NSObject, SCStreamOutput, @unchecked Sendable {
     }
 
     func start() {
+        guard isStarting == false, stream == nil else { return }
+        isStarting = true
+        startGeneration += 1
+        let generation = startGeneration
         Task { [weak self] in
+            guard let self else { return }
+            defer { self.isStarting = false }
             do {
-                try await self?.startCapture()
+                let stream = try await self.startCapture()
+                guard generation == self.startGeneration else {
+                    try? await stream.stopCapture()
+                    return
+                }
+                self.stream = stream
             } catch {
+                guard generation == self.startGeneration else { return }
+                self.stream = nil
                 let message = "ScreenCaptureKitの起動に失敗しました。\nSystem Settings > Privacy & Security > Screen Recording で実行元アプリを許可してください。\n詳細: \(error.localizedDescription)"
-                self?.onError?(message)
+                self.onError?(message)
             }
         }
     }
 
     func stop() {
-        Task { [weak self] in
-            try? await self?.stream?.stopCapture()
+        startGeneration += 1
+        isStarting = false
+        let current = stream
+        stream = nil
+        analyzer = nil
+        Task { [weak current] in
+            try? await current?.stopCapture()
         }
     }
 
-    private func startCapture() async throws {
+    private func startCapture() async throws -> SCStream {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         guard let display = content.displays.first else {
             throw NSError(domain: "MenuBarVisualizer", code: 1, userInfo: [NSLocalizedDescriptionKey: "Display not found"])
@@ -1362,7 +1495,7 @@ final class AudioCapture: NSObject, SCStreamOutput, @unchecked Sendable {
         let stream = SCStream(filter: filter, configuration: configuration, delegate: nil)
         try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue)
         try await stream.startCapture()
-        self.stream = stream
+        return stream
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
